@@ -50,3 +50,33 @@ test_that("Implementing query rewriting", {
   tool_call_request <- chat$get_turns()[[2]]@contents[[1]]
   expect_equal(tool_call_request@arguments$query, "hello world")
 })
+
+test_that("remove chunks by id works", {
+
+  store <- test_store()
+  chat <- chat_ragnar(
+    ellmer::chat_openai, 
+    .store = store,
+    .on_user_turn = function(self, ...) {
+       self$turns_insert_tool_call_request(
+        ...,
+        query = paste(..., collapse = " ")
+      )
+    }
+  )
+
+  chat$chat("advanced R")
+  chunks <- chat$turns_list_chunks()
+  id <- chunks[[1]]$id
+
+  chat$turns_remove_chunks(id)
+
+  chunks <- chat$turns_list_chunks()
+  chunk_ids <- sapply(chunks, function(x) x$id)
+  expect_false(id %in% chunk_ids)
+
+  chat$turns_remove_chunks(chunk_ids)
+  # we removed all turns, thus the tool call request and result turns also got removed
+  expect_equal(length(chat$get_turns(), 2))
+  expect_equal(length(chat$turns_list_chunks()), 0)
+})

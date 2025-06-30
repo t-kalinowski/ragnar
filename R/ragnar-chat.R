@@ -12,7 +12,10 @@
 #'   Eg, the identity is simply `function(self, ...) list(...)`.
 #'   The default callback prunes the previous tool calls from the chat history and
 #'   inserts a tool call request, so that the LLM always sees retrieval results.
-#'
+#' @param .on_retrieval A function that is called when the tool retrieves results.
+#'   It's called with `self` (the instance of `RagnarChat`), `results` the results
+#'   retrieved from the store. It's useful for applying deoverlapping, and for 
+#'   pruning repeated chunks in the context.
 #' @export
 chat_ragnar <- function(
   chat_fun,
@@ -23,10 +26,13 @@ chat_ragnar <- function(
     self$turns_prune_tool_calls(keep_last_n = 0)
     # inserts a new tool call request with the user's input
     self$turns_insert_tool_call_request(..., query = paste(..., collapse = " "))
+  },
+  .on_retrieval = function(self, results) {
+    results
   }
 ) {
   chat <- chat_fun(...)
-  RagnarChat$new(chat, .store, .on_user_turn)
+  RagnarChat$new(chat, .store, .on_user_turn, .on_retrieval)
 }
 
 #' Adds extra capabilities to a `ellmer::Chat` object.
@@ -46,7 +52,13 @@ RagnarChat <- R6::R6Class(
     #'  Eg, the identity is simply `function(self, ...) list(...)`.
     on_user_turn = NULL,
 
-    initialize = function(chat, store, on_user_turn) {
+    #' @field on_retrieval A function that is called when the tool retrieves results.
+    #' It's called with `self` (the instance of `RagnarChat`), `results` the results
+    #' retrieved from the store. It's useful for applying deoverlapping, and for
+    #' pruning repeated chunks in the context.
+    on_retrieval = NULL,
+
+    initialize = function(chat, store, on_user_turn, on_retrieval) {
       self$ragnar_store <- store
       super$initialize(
         chat$get_provider(),
@@ -63,6 +75,7 @@ RagnarChat <- R6::R6Class(
       )
       self$register_tool(self$ragnar_tool_def)
       self$on_user_turn <- on_user_turn
+      self$on_retrieval <- on_retrieval
     },
 
     chat = function(..., echo = NULL) {
@@ -106,6 +119,7 @@ RagnarChat <- R6::R6Class(
       }
 
       results |>
+        private$callback_retrieval() |> 
         dplyr::select(-hash) |>
         jsonlite::toJSON()
     },
@@ -272,6 +286,76 @@ RagnarChat <- R6::R6Class(
     },
 
     #' @description
+    #' Removes chunks from the history by id.
+    #' Rewrites the LLm context remving the chunks with the given ids. It will also
+    #' enitrely remove the tool call request and results if all chunks are removed.
+    #' 
+    #' @param chunk_ids A vector of chunk ids to remove from the chat history.
+    turns_remove_chunks = function(chunk_ids) {
+      turns <- self$get_turns()
+      drop_turn_idx <- integer(0)
+
+      for (ti in seq_along(turns)) {
+        turn <- turns[[ti]]
+        if (turn@role != "user") {
+          next
+        }
+
+        contents <- turn@contents
+        drop_content_idx <- integer(0)
+
+        for (ci in seq_along(contents)) {
+          content <- contents[[ci]]
+
+          if (!S7::S7_inherits(content, ellmer::ContentToolResult)) {
+            next
+          }
+          if (content@request@name != self$ragnar_tool_def@name) {
+            next
+          }
+          if (!is.character(content@value)) {
+            next
+          }
+
+          chunks <- jsonlite::fromJSON(content@value, simplifyVector = FALSE)
+
+          # Remove the chunks with the given ids.
+          chunks <- chunks[!sapply(chunks, function(x) x$id %in% chunk_ids)]
+
+          # If we have no chunks left, we remove the entire content from the list.
+          if (length(chunks) == 0) {
+            drop_content_idx[[length(drop_content_idx) + 1]] <- ci
+            next
+          }
+
+          # Restore the content if some chunks remained.
+          contents[[ci]]@value <- jsonlite::toJSON(chunks, pretty = TRUE)
+        }
+
+        turn@contents <- contents
+        if (length(drop_content_idx) > 0) {
+          turn@contents <- contents[-drop_content_idx]
+        }
+
+        # If we removed all contents from the turn, we remove the entire turn.
+        # and the assistant turn that came before it.
+        if (length(turn@contents) == 0) {
+          drop_turn_idx <- c(drop_turn_idx, ti, ti - 1L)
+          next
+        }
+
+        turns[[ti]] <- turn
+      }
+
+      # Remove the turns that we marked for removal.
+      if (length(drop_turn_idx) > 0) {
+        turns <- turns[-drop_turn_idx]
+      }
+
+      self$set_turns(turns)
+    },
+
+    #' @description
     #' Some LLM's are lazy at tool calling, and for applications to be
     #' robust, it's great to append context for the LLM, even if
     #' it didn't really ask for.
@@ -311,6 +395,10 @@ RagnarChat <- R6::R6Class(
       if (!is.list(result)) {
         result <- list(result)
       }
+      result
+    },
+    callback_retrieval = function(results) {
+      result <- self$on_retrieval(self, results)
       result
     }
   )
