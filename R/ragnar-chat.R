@@ -107,7 +107,14 @@ RagnarChat <- R6::R6Class(
     #' @field ragnar_retrieve A function that retrieves relevant chunks given a query and a store.
     #'   Can be set to any function taking store and query as parameters and returning a data.frame
     #'   of results.
-    ragnar_retrieve = \(store, query) ragnar::ragnar_retrieve(store, query, top_k = 5),
+    ragnar_retrieve = function(store, query) {
+      retrieved_ids <- self$turns_list_chunks() |> 
+        sapply(\(x) x$id)
+
+      dplyr::tbl(store) |>
+        dplyr::filter(!.data$id %in% retrieved_ids) |>
+        ragnar::ragnar_retrieve(query, top_k = 10)
+    },
 
     #' @field ragnar_tool A function that retrieves relevant chunks from the store.
     #'  This is the function that is registered as a tool in the chat.

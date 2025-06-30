@@ -52,7 +52,6 @@ test_that("Implementing query rewriting", {
 })
 
 test_that("remove chunks by id works", {
-
   store <- test_store()
   chat <- chat_ragnar(
     ellmer::chat_openai, 
@@ -77,6 +76,29 @@ test_that("remove chunks by id works", {
 
   chat$turns_remove_chunks(chunk_ids)
   # we removed all turns, thus the tool call request and result turns also got removed
-  expect_equal(length(chat$get_turns(), 2))
   expect_equal(length(chat$turns_list_chunks()), 0)
+  expect_equal(length(chat$get_turns()), 2)
+})
+
+test_that("duplicated chunks are not returned", {
+  store <- test_store()
+  chat <- chat_ragnar(
+    ellmer::chat_openai, 
+    .store = store,
+    .on_user_turn = function(self, ...) {
+      self$turns_insert_tool_call_request(
+        ...,
+        query = paste(..., collapse = " ")
+      )
+    }
+  )
+
+  # chat twice adds the same query and results twice
+  chat$chat("advanced R")
+  chat$chat("advanced R")
+
+  # all ids should be unique
+  new_chunk_ids <- sapply(chat$turns_list_chunks(), function(x) x$id)
+
+  expect_equal(length(unique(new_chunk_ids)), length(new_chunk_ids))
 })
