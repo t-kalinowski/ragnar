@@ -1,6 +1,6 @@
 test_that("RagnarChat", {
   store <- test_store()
-  chat <- chat_ragnar(ellmer::chat_openai, .store = store)
+  chat <- chat_ragnar(ellmer::chat_openai, model = "gpt-4.1-nano", .store = store)
 
   out <- chat$chat("advanced R")
 
@@ -12,12 +12,18 @@ test_that("RagnarChat", {
   expect_equal(length(chat$get_turns()), 2)
   
   out <- chat$chat("advanced R")
-  expect_equal(length(chat$get_turns()), 2 + 2)
+  # 2 turns that were already there + 2 turns of forced tool calls
+  # + user + LLM
+  expect_equal(length(chat$get_turns()), 2 + 2 + 2)
 
   # the default pruning will clear the previous tool calls.
-  # so we end up with 6 turns
+  # so we end up with 6 turns + 1 pair
   out <- chat$chat("more chatting")
-  expect_equal(length(chat$get_turns()), 2 + 2 + 2)
+  expect_equal(length(chat$get_turns()), 6 + 2)
+
+  # prune tool calls will clear two turns
+  chat$turns_prune_tool_calls()
+  expect_equal(length(chat$get_turns()), 6)
 })
 
 test_that("Implementing query rewriting", {
@@ -33,6 +39,7 @@ test_that("Implementing query rewriting", {
   store <- test_store()
   chat <- chat_ragnar(
     ellmer::chat_openai, 
+    model = "gpt-4.1-nano",
     .store = store,
     .on_user_turn = function(self, ...) {
       
@@ -55,6 +62,7 @@ test_that("remove chunks by id works", {
   store <- test_store()
   chat <- chat_ragnar(
     ellmer::chat_openai, 
+    model = "gpt-4.1-nano",
     .store = store,
     .on_user_turn = function(self, ...) {
        self$turns_insert_tool_call_request(
@@ -84,6 +92,7 @@ test_that("duplicated chunks are not returned", {
   store <- test_store()
   chat <- chat_ragnar(
     ellmer::chat_openai, 
+    model = "gpt-4.1-nano",
     .store = store,
     .on_user_turn = function(self, ...) {
       self$turns_insert_tool_call_request(
@@ -101,4 +110,28 @@ test_that("duplicated chunks are not returned", {
   new_chunk_ids <- sapply(chat$turns_list_chunks(), function(x) x$id)
 
   expect_equal(length(unique(new_chunk_ids)), length(new_chunk_ids))
+})
+
+test_that("Can insert chunks premptively in the user chat", {
+  store <- test_store()
+  chat <- chat_ragnar(
+    ellmer::chat_openai, 
+    model = "gpt-4.1-nano",
+    .store = store,
+    .on_user_turn = function(self, ...) {
+      self$turns_insert_documents(
+        ...,
+        query = paste(..., collapse = " ")
+      )
+    }
+  )
+
+  out <- chat$chat("advanced R")
+  expect_equal(length(chat$get_turns()), 2)
+  # it adds the documents into the context
+  expect_equal(length(chat$get_turns()[[1]]@contents), 2)
+
+  chat$turns_prune_chunks()
+  expect_equal(length(chat$get_turns()), 2)
+  expect_equal(length(chat$get_turns()[[1]]@contents), 1)
 })

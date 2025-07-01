@@ -253,9 +253,10 @@ RagnarChat <- R6::R6Class(
               # when it's a tool result we drop the assistant turn that (usually a tool call)
               c(ti, ti - 1)
             } else if (S7::S7_inherits(content, ContentRagnarDocuments)) {
-              # when it's content ragnar documents, we drop the next turn - because we proactively
-              # inserted the documents and the next turn is just the LLM acknowledging them.
-              c(ti, ti + 1)
+              # when it's content ragnar documents, we drop only the current turn.
+              # Note: tha's unlikely to ever drop a turn because the turn also contains
+              # the user question, so we always have at least one content.
+              ti
             }
             next
           }
@@ -327,9 +328,10 @@ RagnarChat <- R6::R6Class(
               # when it's a tool result we drop the assistant turn that (usually a tool call)
               c(ti, ti - 1)
             } else if (S7::S7_inherits(content, ContentRagnarDocuments)) {
-              # when it's content ragnar documents, we drop the next turn - because we proactively
-              # inserted the documents and the next turn is just the LLM acknowledging them.
-              c(ti, ti + 1)
+              # when it's content ragnar documents, we drop only the current turn.
+              # Note: tha's unlikely to ever drop a turn because the turn also contains
+              # the user question, so we always have at least one content.
+              ti
             }
             next
           }
@@ -399,39 +401,19 @@ RagnarChat <- R6::R6Class(
     #' @description Some models do not support tool calling, so instead of adding a tool call
     #' request (faking that the model asked for some search results) we actually
     #' proactively insert context into the chat user - as if the user did it had done it.
-    #' - User: {documents}
-    #' - LLM: {llm_answer}.
-    #' - {...} The contents of the user turn that generated the tool call.
+    #' - User: {question} {documents}
+    #' - LLM: answer
     #' @param ... The contents of the user turn that generated the tool call.
-    #' @param llm_answer The answer that the LLM should give after the documents are inserted.
-    #' @param after The index in the turns list to insert the user and assistant turns.
     turns_insert_documents = function(
       ...,
-      query,
-      llm_answer = "Thanks for the information. I'll use the documents to answer your question. Please ask a question.",
-      after = 0L
+      query
     ) {
       documents <- self$ragnar_tool(query)
 
-      user_turn <- ellmer::Turn(
-        role = "user",
-        contents = list(
-          ContentRagnarDocuments(text = documents)
-        )
+      list(
+        ...,
+        ContentRagnarDocuments(text = documents)
       )
-
-      assistant_turn <- ellmer::Turn(
-        role = "assistant",
-        contents = list(
-          ellmer::ContentText(text = llm_answer)
-        )
-      )
-
-      turns <- self$get_turns()
-      turns <- append(turns, list(user_turn, assistant_turn), after = after)
-      self$set_turns(turns)
-
-      list(...)
     }
   ),
 
