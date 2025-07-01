@@ -12,27 +12,34 @@
 #'   Eg, the identity is simply `function(self, ...) list(...)`.
 #'   The default callback prunes the previous tool calls from the chat history and
 #'   inserts a tool call request, so that the LLM always sees retrieval results.
-#' @param .on_retrieval A function that is called when the tool retrieves results.
-#'   It's called with `self` (the instance of `RagnarChat`), `results` the results
-#'   retrieved from the store. It's useful for applying deoverlapping, and for 
-#'   pruning repeated chunks in the context.
+#' @param .retrieve A function that takes `self` (the instance of `RagnarChat`) and `query`
+#'   (the query to retrieve results for) and returns a data.frame of chunks as results.
+#'   The default implementation calls `ragnar_retrieve()` on chunks, after filtering those
+#'   already present in the chat history.
 #' @export
 chat_ragnar <- function(
   chat_fun,
   ...,
   .store,
+  .register_store = TRUE,
   .on_user_turn = function(self, ...) {
     # prunes previously inserted tool calls
-    self$turns_prune_tool_calls(keep_last_n = 0)
+    self$turns_prune_chunks(keep_last_n = 0)
     # inserts a new tool call request with the user's input
     self$turns_insert_tool_call_request(..., query = paste(..., collapse = " "))
   },
-  .on_retrieval = function(self, results) {
-    results
+  .retrieve = function(self, query) {
+    retrieved_ids <- self$turns_list_chunks() |>
+      sapply(\(x) x$id)
+
+    self$ragnar_store |>
+      dplyr::tbl() |>
+      dplyr::filter(!.data$id %in% retrieved_ids) |>
+      ragnar::ragnar_retrieve(query, top_k = 10)
   }
 ) {
   chat <- chat_fun(...)
-  RagnarChat$new(chat, .store, .on_user_turn, .on_retrieval)
+  RagnarChat$new(chat, .store, .register_store, .on_user_turn, .on_retrieval, .retrieve)
 }
 
 #' Adds extra capabilities to a `ellmer::Chat` object.
@@ -52,13 +59,19 @@ RagnarChat <- R6::R6Class(
     #'  Eg, the identity is simply `function(self, ...) list(...)`.
     on_user_turn = NULL,
 
-    #' @field on_retrieval A function that is called when the tool retrieves results.
-    #' It's called with `self` (the instance of `RagnarChat`), `results` the results
-    #' retrieved from the store. It's useful for applying deoverlapping, and for
-    #' pruning repeated chunks in the context.
-    on_retrieval = NULL,
+    #' @field ragnar_retrieve A function that retrieves relevant chunks given a query and a store.
+    #'  Can be set to any function taking `self` and `query`` as parameters and returning a data.frame
+    #'  of results.
+    ragnar_retrieve = NULL,
 
-    initialize = function(chat, store, on_user_turn, on_retrieval) {
+    initialize = function(
+      chat,
+      store,
+      register_store,
+      on_user_turn,
+      on_retrieval,
+      ragnar_retrieve
+    ) {
       self$ragnar_store <- store
       super$initialize(
         chat$get_provider(),
@@ -73,9 +86,11 @@ RagnarChat <- R6::R6Class(
           "The text to find most relevant matches for."
         )
       )
-      self$register_tool(self$ragnar_tool_def)
+      if (register_store) {
+        self$register_tool(self$ragnar_tool_def)
+      }
       self$on_user_turn <- on_user_turn
-      self$on_retrieval <- on_retrieval
+      self$ragnar_retrieve <- ragnar_retrieve
     },
 
     chat = function(..., echo = NULL) {
@@ -104,30 +119,16 @@ RagnarChat <- R6::R6Class(
       )
     },
 
-    #' @field ragnar_retrieve A function that retrieves relevant chunks given a query and a store.
-    #'   Can be set to any function taking store and query as parameters and returning a data.frame
-    #'   of results.
-    ragnar_retrieve = function(store, query) {
-      retrieved_ids <- self$turns_list_chunks() |> 
-        sapply(\(x) x$id)
-
-      dplyr::tbl(store) |>
-        dplyr::filter(!.data$id %in% retrieved_ids) |>
-        ragnar::ragnar_retrieve(query, top_k = 10)
-    },
-
     #' @field ragnar_tool A function that retrieves relevant chunks from the store.
     #'  This is the function that is registered as a tool in the chat.
     ragnar_tool = function(query) {
-      results <- self$ragnar_retrieve(self$ragnar_store, query)
+      results <- self$ragnar_retrieve(self, query)
 
       if (!is.data.frame(results)) {
         stop("The ragnar_retrieve function must return a data.frame.")
       }
 
       results |>
-        private$callback_retrieval() |> 
-        dplyr::select(-hash) |>
         jsonlite::toJSON()
     },
 
@@ -192,18 +193,9 @@ RagnarChat <- R6::R6Class(
           next
         }
         for (content in turn@contents) {
-          if (!S7::S7_inherits(content, ellmer::ContentToolResult)) {
-            next
-          }
-          if (content@request@name != self$ragnar_tool_def@name) {
-            next
-          }
-          if (!is.character(content@value)) {
-            next
-          }
           chunks <- append(
             chunks,
-            jsonlite::fromJSON(content@value, simplifyVector = FALSE)
+            content_get_chunks(content, tool_name = self$ragnar_tool_def@name)
           )
         }
       }
@@ -224,6 +216,7 @@ RagnarChat <- R6::R6Class(
       drop_turn_idx <- integer(0)
       for (ti in rev(seq_along(turns))) {
         turn <- turns[[ti]]
+
         if (turn@role != "user") {
           next
         }
@@ -233,18 +226,10 @@ RagnarChat <- R6::R6Class(
         drop_content_idx <- integer(0)
         for (ci in rev(seq_along(contents))) {
           content <- contents[[ci]]
-
-          if (!S7::S7_inherits(content, ellmer::ContentToolResult)) {
+          chunks <- content_get_chunks(content, tool_name = self$ragnar_tool_def@name)
+          if (is.null(chunks)) {
             next
           }
-          if (content@request@name != self$ragnar_tool_def@name) {
-            next
-          }
-          if (!is.character(content@value)) {
-            next
-          }
-
-          chunks <- jsonlite::fromJSON(content@value, simplifyVector = FALSE)
 
           # We still have to skip some chunks, we check if we can skip everything from this
           # tool result.
@@ -262,11 +247,21 @@ RagnarChat <- R6::R6Class(
           # If we have no chunks left, we remove the entire content from the list.
           if (length(chunks) == 0) {
             drop_content_idx[[length(drop_content_idx) + 1]] <- ci
+            turns_to_drop <- if (
+              S7::S7_inherits(content, ellmer::ContentToolResult)
+            ) {
+              # when it's a tool result we drop the assistant turn that (usually a tool call)
+              c(ti, ti - 1)
+            } else if (S7::S7_inherits(content, ContentRagnarDocuments)) {
+              # when it's content ragnar documents, we drop the next turn - because we proactively
+              # inserted the documents and the next turn is just the LLM acknowledging them.
+              c(ti, ti + 1)
+            }
             next
           }
 
           # Restore the content if some chunks remained.
-          contents[[ci]]@value <- jsonlite::toJSON(chunks, pretty = TRUE)
+          contents[[ci]] <- content_set_chunks(content, chunks)
         }
 
         turn@contents <- contents
@@ -275,9 +270,10 @@ RagnarChat <- R6::R6Class(
         }
 
         # If we removed all contents from the turn, we remove the entire turn.
-        # and the assistant turn that came before it.
+        # and the assistant turn that came before or after it, dependning on what
+        # triggered the removal - a tool call result or a proactively added set of documents
         if (length(turn@contents) == 0) {
-          drop_turn_idx <- c(drop_turn_idx, ti, ti - 1)
+          drop_turn_idx <- c(drop_turn_idx, turns_to_drop)
           next
         }
 
@@ -296,7 +292,7 @@ RagnarChat <- R6::R6Class(
     #' Removes chunks from the history by id.
     #' Rewrites the LLm context remving the chunks with the given ids. It will also
     #' enitrely remove the tool call request and results if all chunks are removed.
-    #' 
+    #'
     #' @param chunk_ids A vector of chunk ids to remove from the chat history.
     turns_remove_chunks = function(chunk_ids) {
       turns <- self$get_turns()
@@ -314,17 +310,10 @@ RagnarChat <- R6::R6Class(
         for (ci in seq_along(contents)) {
           content <- contents[[ci]]
 
-          if (!S7::S7_inherits(content, ellmer::ContentToolResult)) {
+          chunks <- content_get_chunks(content, self$ragnar_tool_def@name)
+          if (is.null(chunks)) {
             next
           }
-          if (content@request@name != self$ragnar_tool_def@name) {
-            next
-          }
-          if (!is.character(content@value)) {
-            next
-          }
-
-          chunks <- jsonlite::fromJSON(content@value, simplifyVector = FALSE)
 
           # Remove the chunks with the given ids.
           chunks <- chunks[!sapply(chunks, function(x) x$id %in% chunk_ids)]
@@ -332,11 +321,21 @@ RagnarChat <- R6::R6Class(
           # If we have no chunks left, we remove the entire content from the list.
           if (length(chunks) == 0) {
             drop_content_idx[[length(drop_content_idx) + 1]] <- ci
+            turns_to_drop <- if (
+              S7::S7_inherits(content, ellmer::ContentToolResult)
+            ) {
+              # when it's a tool result we drop the assistant turn that (usually a tool call)
+              c(ti, ti - 1)
+            } else if (S7::S7_inherits(content, ContentRagnarDocuments)) {
+              # when it's content ragnar documents, we drop the next turn - because we proactively
+              # inserted the documents and the next turn is just the LLM acknowledging them.
+              c(ti, ti + 1)
+            }
             next
           }
 
           # Restore the content if some chunks remained.
-          contents[[ci]]@value <- jsonlite::toJSON(chunks, pretty = TRUE)
+          contents[[ci]] <- content_set_chunks(content, chunks)
         }
 
         turn@contents <- contents
@@ -345,9 +344,10 @@ RagnarChat <- R6::R6Class(
         }
 
         # If we removed all contents from the turn, we remove the entire turn.
-        # and the assistant turn that came before it.
+        # and the assistant turn that came before or after it, dependning on what
+        # triggered the removal - a tool call result or a proactively added set of documents
         if (length(turn@contents) == 0) {
-          drop_turn_idx <- c(drop_turn_idx, ti, ti - 1L)
+          drop_turn_idx <- c(drop_turn_idx, turns_to_drop)
           next
         }
 
@@ -394,8 +394,47 @@ RagnarChat <- R6::R6Class(
         self$ragnar_tool(query),
         request = tool_request
       )
+    },
+
+    #' @description Some models do not support tool calling, so instead of adding a tool call
+    #' request (faking that the model asked for some search results) we actually
+    #' proactively insert context into the chat user - as if the user did it had done it.
+    #' - User: {documents}
+    #' - LLM: {llm_answer}.
+    #' - {...} The contents of the user turn that generated the tool call.
+    #' @param ... The contents of the user turn that generated the tool call.
+    #' @param llm_answer The answer that the LLM should give after the documents are inserted.
+    #' @param after The index in the turns list to insert the user and assistant turns.
+    turns_insert_documents = function(
+      ...,
+      query,
+      llm_answer = "Thanks for the information. I'll use the documents to answer your question. Please ask a question.",
+      after = 0L
+    ) {
+      documents <- self$ragnar_tool(query)
+
+      user_turn <- ellmer::Turn(
+        role = "user",
+        contents = list(
+          ContentRagnarDocuments(text = documents)
+        )
+      )
+
+      assistant_turn <- ellmer::Turn(
+        role = "assistant",
+        contents = list(
+          ellmer::ContentText(text = llm_answer)
+        )
+      )
+
+      turns <- self$get_turns()
+      turns <- append(turns, list(user_turn, assistant_turn), after = after)
+      self$set_turns(turns)
+
+      list(...)
     }
   ),
+
   private = list(
     callback_user_turn = function(...) {
       result <- self$on_user_turn(self, ...)
@@ -403,10 +442,37 @@ RagnarChat <- R6::R6Class(
         result <- list(result)
       }
       result
-    },
-    callback_retrieval = function(results) {
-      result <- self$on_retrieval(self, results)
-      result
     }
   )
 )
+
+ContentRagnarDocuments <- S7::new_class(
+  "ContentRagnarDocuments",
+  parent = ellmer::ContentText
+)
+
+content_get_chunks <- function(x, tool_name) {
+  value <- if (S7::S7_inherits(x, ContentRagnarDocuments)) {
+    x@text
+  } else if (S7::S7_inherits(x, ellmer::ContentToolResult)) {
+    if (x@request@name != tool_name) {
+      return(NULL)
+    }
+    x@value
+  } else {
+    return(NULL)
+  }
+  jsonlite::fromJSON(value, simplifyVector = FALSE)
+}
+
+content_set_chunks <- function(x, chunks) {
+  chunks <- jsonlite::toJSON(chunks, pretty = TRUE)
+  if (S7::S7_inherits(x, ContentRagnarDocuments)) {
+    x@text <- chunks
+  } else if (S7::S7_inherits(x, ellmer::ContentToolResult)) {
+    x@value <- chunks
+  } else {
+    stop("Unsupported content type for setting chunks.")
+  }
+  x
+}

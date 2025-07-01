@@ -1,0 +1,127 @@
+---
+title: "Using ragnar_chat"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{Using ragnar_chat}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r, include = FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>"
+)
+```
+
+```{r setup}
+library(ragnar)
+```
+
+The `ragnar_chat` interface adds common RAG systems functionalities to an `ellmer::Chat`, allowing
+users to easily manage and operate on the LLM chat history, customize the search behavior and etc.
+
+This vignettes shows a few patterns for customizing the behavior of `ragnar_chat`.
+To make the examples simpler, we will create a small knowledge base with a single document and a few chunks:
+
+```{r}
+store <- ragnar_store_create(
+  embed = \(x) embed_openai(x, model = "text-embedding-3-small")
+)
+  
+doc <- "https://r4ds.hadley.nz/base-R.html"
+chunks <- ragnar_read(doc, frame_by_tags = c("h3"))
+ragnar_store_insert(store, chunks)
+ragnar_store_build_index(store)
+```
+
+## Implement Query Rewriting
+
+When the LLM queries the knowledge base, it may not use terms and keywords that are present in the knowledge base. To improve the chances of a successful query, you can implement query rewriting. It's also possible to
+use another LLM to create a few slightly different queries and combine the results into a single set.
+
+We first implement a function that takes a query and rewrites it using another LLM. Usually a smaller model is used for this task, as it is not very computationally intensive and the results are not very sensitive to the model size.
+
+```{r}
+query_rewrite <- function(query) {
+  chat <- ellmer::chat_openai(
+    model = "gpt-4.1-nano",
+    system_prompt = paste(
+      "You are a helpful assistant that rewrites queries to improve search results.",
+      "You may return a few different queries, whose results will be combined.",
+      "Queries should be concise and relevant to the original query.",
+      "You may use synonyms, rephrase, or add relevant keywords.",
+      collapse = "\n"
+    )
+  )
+  chat$chat_structured(
+    paste0("Rewrite the following query to improve search results: ", query),
+    type = ellmer::type_array(
+      ellmer::type_string(),
+      description = "Rewritten queries"
+    )
+  )
+}
+```
+
+Now we create a `ragnar_chat` object that uses the `query_rewrite` function to rewrite queries before searching the knowledge base. To do that, we customize the `.retrieve` callback. This callback takes `self` (the instance of `ragnar_chat`) and `query` (the original query) as arguments. It should return a list of results, which will be combined into a single set. The default behavior of `.retrieve` is to use `ragnar::ragnar_retrieve()` to search the knowledge base, but we will override it to use our `query_rewrite` function.
+
+```{r}
+chat <- chat_ragnar(
+  ellmer::chat_openai,
+  .store = store,
+  .retrieve = function(self, query) {
+    queries <- query_rewrite(query)
+    cli::cli_inform(
+      i = "Rewriten queries:",
+      queries
+    )
+    queries |> 
+      purrr::map_dfr(\(q) ragnar::ragnar_retrieve(self$ragnar_store, q)) |> 
+      dplyr::distinct()
+  }
+)
+```
+
+Now we can use the `chat` object to ask questions and see how it rewrites the queries and retrieves the results:
+
+```{r}
+cat(chat$chat("What is the difference between a vector and a list in R?"))
+```
+
+## Customize retrieval results
+
+Some models are not trained to support function calls, thus inserting tool calls into the chat
+history may confuse the model and lead to incresased hallucinations. A common solution for this 
+problem is to include a pair of turns in the top of the chat history that adds relevant documents
+to the chat history, so that the model can use them to answer the question.
+
+This is implemented by customizing the `.on_user_turn` callback. This callback is called with the
+`self` (the instance of `ragnar_chat`) and `...` (the user inpuits when calling `$chat`). It should
+return a list of `ellmer::Content` obejcts that will be forwarded to the actual `$chat` call.
+
+Here's an example of how to implement this callback:
+
+```{r}
+chat <- chat_ragnar(
+  ellmer::chat_openai, 
+  .store = store,
+  # We explicitly avoid registering the store so the LLM is not capable of making tool
+  # calls to the store. Instead, it relies on the documents inserted at the top of
+  # the chat history to answer the question.
+  .register_store = FALSE,
+  .on_user_turn = function(self, ...) {
+    self$turns_prune_chunks()
+    # Inserts documents relevant to the query at the top of the chat history.
+    self$turns_insert_documents(
+      ...,
+      query = paste(..., collapse = "\n")
+    )
+  }
+)
+```
+
+```{r}
+cat(chat$chat("What is the difference between a vector and a list in R?"))
+```
+
