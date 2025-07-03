@@ -1,6 +1,6 @@
 test_that("RagnarChat", {
   store <- test_store()
-  chat <- chat_ragnar(ellmer::chat_openai, model = "gpt-4.1-nano", .store = store)
+  chat <- chat_ragnar(\() ellmer::chat_openai(model = "gpt-4.1-nano"), store = store)
 
   out <- chat$chat("advanced R")
 
@@ -38,10 +38,9 @@ test_that("Implementing query rewriting", {
 
   store <- test_store()
   chat <- chat_ragnar(
-    ellmer::chat_openai, 
-    model = "gpt-4.1-nano",
-    .store = store,
-    .on_user_turn = function(self, ...) {
+    \() ellmer::chat_openai(model = "gpt-4.1-nano"), 
+    store = store,
+    on_user_turn = function(self, ...) {
       
       self$turns_prune_tool_calls()
       self$turns_insert_tool_call_request(
@@ -61,10 +60,9 @@ test_that("Implementing query rewriting", {
 test_that("remove chunks by id works", {
   store <- test_store()
   chat <- chat_ragnar(
-    ellmer::chat_openai, 
-    model = "gpt-4.1-nano",
-    .store = store,
-    .on_user_turn = function(self, ...) {
+    \() ellmer::chat_openai(model = "gpt-4.1-nano"), 
+    store = store,
+    on_user_turn = function(self, ...) {
        self$turns_insert_tool_call_request(
         ...,
         query = paste(..., collapse = " ")
@@ -91,10 +89,9 @@ test_that("remove chunks by id works", {
 test_that("duplicated chunks are not returned", {
   store <- test_store()
   chat <- chat_ragnar(
-    ellmer::chat_openai, 
-    model = "gpt-4.1-nano",
-    .store = store,
-    .on_user_turn = function(self, ...) {
+    \() ellmer::chat_openai(model = "gpt-4.1-nano"), 
+    store = store,
+    on_user_turn = function(self, ...) {
       self$turns_insert_tool_call_request(
         ...,
         query = paste(..., collapse = " ")
@@ -115,10 +112,9 @@ test_that("duplicated chunks are not returned", {
 test_that("Can insert chunks premptively in the user chat", {
   store <- test_store()
   chat <- chat_ragnar(
-    ellmer::chat_openai, 
-    model = "gpt-4.1-nano",
-    .store = store,
-    .on_user_turn = function(self, ...) {
+    \() ellmer::chat_openai(model = "gpt-4.1-nano"), 
+    store = store,
+    on_user_turn = function(self, ...) {
       self$turns_insert_documents(
         ...,
         query = paste(..., collapse = " ")

@@ -1,34 +1,33 @@
 #' Creates an `ellmer::Chat` with increased capabilities
 #' powered by `ragnar::RagnarStore`.
 #'
-#' @param chat_fun A function that returns an `ellmer::Chat` object,
-#'   sunch as [ellmer::chat_openai()] , etc.
-#' @param ... Additional parameters passed to `chat_fun`.
-#' @param .store An `ragnar::RagnarStore` object that contains the knowledge base that powers
+#' @param chat A function that returns an `ellmer::Chat` object,
+#'   such as [ellmer::chat_openai()] , etc.
+#' @param store An `ragnar::RagnarStore` object that contains the knowledge base that powers
 #'   this chat.
-#' @param .on_user_turn A function that is called when the user sends a message.
+#' @param register_store_tool If `TRUE`, the `store` is registered as a tool in the chat. 
+#' @param on_user_turn A function that is called when the user sends a message.
 #'   It's called with `self` (the instance of `RagnarChat`), and `...` the message
 #'   sent by the user. It's output is passed to `ellmer::Chat$chat()`.
 #'   Eg, the identity is simply `function(self, ...) list(...)`.
 #'   The default callback prunes the previous tool calls from the chat history and
 #'   inserts a tool call request, so that the LLM always sees retrieval results.
-#' @param .retrieve A function that takes `self` (the instance of `RagnarChat`) and `query`
+#' @param retrieve A function that takes `self` (the instance of `RagnarChat`) and `query`
 #'   (the query to retrieve results for) and returns a data.frame of chunks as results.
 #'   The default implementation calls `ragnar_retrieve()` on chunks, after filtering those
 #'   already present in the chat history.
 #' @export
 chat_ragnar <- function(
-  chat_fun,
-  ...,
-  .store,
-  .register_store = TRUE,
-  .on_user_turn = function(self, ...) {
+  chat,
+  store,
+  register_store_tool = TRUE,
+  on_user_turn = function(self, ...) {
     # prunes previously inserted tool calls
     self$turns_prune_chunks(keep_last_n = 0)
     # inserts a new tool call request with the user's input
     self$turns_insert_tool_call_request(..., query = paste(..., collapse = " "))
   },
-  .retrieve = function(self, query) {
+  retrieve = function(self, query) {
     retrieved_ids <- self$turns_list_chunks() |>
       sapply(\(x) x$id)
 
@@ -38,8 +37,8 @@ chat_ragnar <- function(
       ragnar::ragnar_retrieve(query, top_k = 10)
   }
 ) {
-  chat <- chat_fun(...)
-  RagnarChat$new(chat, .store, .register_store, .on_user_turn, .on_retrieval, .retrieve)
+  chat <- chat()
+  RagnarChat$new(chat, store, register_store_tool, on_user_turn, on_retrieval, retrieve)
 }
 
 #' Adds extra capabilities to a `ellmer::Chat` object.
@@ -67,7 +66,7 @@ RagnarChat <- R6::R6Class(
     initialize = function(
       chat,
       store,
-      register_store,
+      register_store_tool,
       on_user_turn,
       on_retrieval,
       ragnar_retrieve
@@ -86,7 +85,7 @@ RagnarChat <- R6::R6Class(
           "The text to find most relevant matches for."
         )
       )
-      if (register_store) {
+      if (register_store_tool) {
         self$register_tool(self$ragnar_tool_def)
       }
       self$on_user_turn <- on_user_turn
